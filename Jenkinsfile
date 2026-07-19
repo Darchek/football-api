@@ -17,6 +17,29 @@ pipeline {
     }
 
     stages {
+        stage('Sync Source') {
+            steps {
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: 'host-ssh-key',
+                    keyFileVariable: 'SSH_KEY',
+                    usernameVariable: 'SSH_USER'
+                )]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no \
+                            -i \$SSH_KEY \
+                            \$SSH_USER@${HOST} \
+                            'export PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+                             set -e
+                             cd ${DEPLOY_DIR}
+                             git fetch origin main
+                             git reset --hard origin/main
+                             git clean -fd
+                             git status --short'
+                    """
+                }
+            }
+        }
+
         stage('Unit Tests') {
             steps {
                 withCredentials([sshUserPrivateKey(
