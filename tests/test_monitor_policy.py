@@ -108,10 +108,49 @@ def test_start_runs_initial_scan_and_stop_cancels_scheduler() -> None:
 
         await coordinator.start()
         await asyncio.sleep(0)
+
+        queue = coordinator.get_upcoming_fetches()
+        assert len(queue) == 2
+        assert all(item.kind.value == "daily_scan" for item in queue)
+        assert all(item.scheduled_for.hour == 10 for item in queue)
+        assert {item.tournament for item in queue} == {"fifa.world", "esp.1"}
+
         await coordinator.stop()
 
         assert match_service.get_matches.await_count == 2
         assert coordinator.active_monitor_count == 0
+
+    asyncio.run(exercise())
+
+
+def test_queue_contains_next_match_poll_and_daily_scan() -> None:
+    async def exercise() -> None:
+        match_service = AsyncMock()
+        match_service.get_matches.return_value = [
+            make_match(starts_in=timedelta(minutes=30))
+        ]
+        coordinator = MatchMonitorCoordinator(
+            match_service,
+            ("esp.1",),
+            timezone="UTC",
+            daily_scan_hour=10,
+            now_provider=lambda: NOW,
+        )
+
+        await coordinator.start()
+        await asyncio.sleep(0)
+        queue = coordinator.get_upcoming_fetches()
+        await coordinator.stop()
+
+        assert len(queue) == 2
+        assert queue[0].kind.value == "match_poll"
+        assert queue[0].tournament == "esp.1"
+        assert queue[0].match_id == "match-1"
+        assert queue[0].frequency == "every 10 minutes"
+        assert queue[0].interval_seconds == 600.0
+        assert queue[0].seconds_until == 600.0
+        assert queue[1].kind.value == "daily_scan"
+        assert queue[1].scheduled_for.hour == 10
 
     asyncio.run(exercise())
 
@@ -280,10 +319,10 @@ def test_sends_telegram_for_every_match_status_transition() -> None:
             }
         )
 
-        await coordinator._handle_state_transition(scheduled, first_half)
-        await coordinator._handle_state_transition(first_half, halftime)
-        await coordinator._handle_state_transition(halftime, second_half)
-        await coordinator._handle_state_transition(second_half, finished)
+        await coordinator.handle_state_transition(scheduled, first_half)
+        await coordinator.handle_state_transition(first_half, halftime)
+        await coordinator.handle_state_transition(halftime, second_half)
+        await coordinator.handle_state_transition(second_half, finished)
 
         messages = [call.args[0] for call in telegram_client.send_message.await_args_list]
         assert len(messages) == 4
@@ -334,7 +373,7 @@ def test_sends_telegram_for_new_goals_cards_and_penalties() -> None:
             update={"home_score": 1, "away_score": 0, "events": events}
         )
 
-        await coordinator._handle_new_match_events(previous, current)
+        await coordinator.handle_new_match_events(previous, current)
 
         messages = [call.args[0] for call in telegram_client.send_message.await_args_list]
         assert len(messages) == 4

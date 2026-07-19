@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 
-from app.api.routes import matches, system
+from app.api.routes import matches, monitoring, system
 from app.clients.espn import EspnScoreboardClient
 from app.clients.telegram import TelegramClient
 from app.core.config import get_settings
@@ -52,3 +52,4 @@ app = FastAPI(
 
 app.include_router(system.router)
 app.include_router(matches.router)
+app.include_router(monitoring.router)

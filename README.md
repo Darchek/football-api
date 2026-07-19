@@ -12,7 +12,7 @@ Telegram notifications.
 - Today's FIFA World Cup and La Liga matches.
 - Typed `Match`, `Team`, `Player`, and `MatchEvent` responses.
 - Goals, cards, penalties, own goals, and shootout events.
-- Automatic tournament discovery at startup and every day at 05:00.
+- Automatic tournament discovery at startup and every day at 10:00.
 - Adaptive polling before kickoff, during play, and at halftime.
 - Telegram messages for detected matches, status transitions, and new events.
 - Automatic event deduplication during each monitoring process.
@@ -49,7 +49,7 @@ ESPN_BASE_URL=https://site.api.espn.com/apis/site/v2/sports/soccer
 TELEGRAM_API=https://example.com/telegram/send
 MONITORED_TOURNAMENTS=["fifa.world","esp.1"]
 MONITOR_TIMEZONE=Europe/Madrid
-DAILY_SCAN_HOUR=5
+DAILY_SCAN_HOUR=10
 ```
 
 | Variable | Description |
@@ -91,6 +91,7 @@ documentation at `http://127.0.0.1:8000/docs`.
 | `GET` | `/health` | Health check. |
 | `GET` | `/api/v1/matches/fifa-world-cup` | Today's FIFA World Cup matches. |
 | `GET` | `/api/v1/matches/la-liga` | Today's La Liga matches. |
+| `GET` | `/api/v1/monitoring/queue` | Up to 20 upcoming monitor fetches. |
 
 Match endpoints return normalized objects rather than ESPN's raw response:
 
@@ -198,6 +199,49 @@ The monitor logs fixture discovery, kickoff, halftime, second-half kickoff,
 full time, and every new match event. Active monitoring tasks are cancelled
 cleanly when the application shuts down.
 
+### Monitoring queue
+
+Inspect the next fetch currently queued by every active match monitor, plus the
+next daily scan for each configured tournament:
+
+```http
+GET /api/v1/monitoring/queue
+GET /api/v1/monitoring/queue?limit=20
+```
+
+Entries are ordered by `scheduled_for` and include the tournament, optional
+match, frequency, exact interval, and remaining seconds:
+
+```json
+[
+  {
+    "id": "match:esp.1:123",
+    "kind": "match_poll",
+    "tournament": "esp.1",
+    "match_id": "123",
+    "match_name": "Home FC vs Away FC",
+    "scheduled_for": "2026-07-19T12:10:00+02:00",
+    "seconds_until": 600,
+    "interval_seconds": 600,
+    "frequency": "every 10 minutes"
+  },
+  {
+    "id": "daily:esp.1",
+    "kind": "daily_scan",
+    "tournament": "esp.1",
+    "match_id": null,
+    "match_name": null,
+    "scheduled_for": "2026-07-20T10:00:00+02:00",
+    "seconds_until": 78600,
+    "interval_seconds": null,
+    "frequency": "daily at 10:00"
+  }
+]
+```
+
+Only the next real fetch for each task is shown. Future recurring fetches are
+not predicted because their frequency can change after every ESPN response.
+
 ## Telegram notifications
 
 The Telegram API is called with:
@@ -223,6 +267,34 @@ Messages include the match clock, score, team, and affected player when ESPN
 provides that information. A discovered fixture is not notified twice during
 the same process, and match events are identified by stable IDs.
 
+## Accelerated match replay
+
+Use a completed ESPN match to exercise the same transition, event, logging,
+and Telegram handlers used by live monitoring. The replay starts with a
+scheduled 0-0 match and no events, then advances through kickoff, first-half
+events, halftime, the second half, remaining events, and full time.
+
+Run a log-only replay of the first FIFA World Cup match from July 11, 2026:
+
+```powershell
+python simulate_match.py --date 20260711 --delay 0.25
+```
+
+Select a specific ESPN match:
+
+```powershell
+python simulate_match.py --date 20260711 --match-id 760512 --delay 0.25
+```
+
+Send real Telegram notifications during the accelerated replay:
+
+```powershell
+python simulate_match.py --date 20260711 --match-id 760512 --delay 0.25 --send-telegram
+```
+
+Telegram is disabled by default for simulations to prevent accidental message
+spam. The `--delay` option controls the number of seconds between updates.
+
 ## Project structure
 
 ```text
@@ -231,6 +303,7 @@ app/
 |   |-- dependencies.py
 |   `-- routes/
 |       |-- matches.py
+|       |-- monitoring.py
 |       `-- system.py
 |-- clients/
 |   |-- espn.py
@@ -240,6 +313,7 @@ app/
 |-- models/
 |   |-- match.py
 |   |-- match_event.py
+|   |-- monitoring_fetch.py
 |   |-- player.py
 |   `-- team.py
 |-- monitoring/
@@ -247,6 +321,8 @@ app/
 |   `-- policy.py
 |-- services/
 |   `-- matches.py
+|-- simulation/
+|   `-- replay.py
 `-- main.py
 ```
 

@@ -48,6 +48,33 @@ class MonitorPolicy:
 
         return cls.TWO_SECONDS
 
+    @classmethod
+    def poll_frequency(
+        cls,
+        match: Match,
+        now: datetime,
+        halftime_started_at: datetime | None = None,
+    ) -> str:
+        """Describe the polling phase responsible for the next fetch."""
+        if cls.is_halftime(match):
+            if halftime_started_at is not None:
+                halftime_elapsed = (now - halftime_started_at).total_seconds()
+                if halftime_elapsed >= cls.HALFTIME_SLOW_PERIOD:
+                    return "every 2 seconds"
+            return "every 5 minutes"
+
+        if match.status == "in":
+            return "every 2 seconds"
+
+        seconds_to_start = (match.starts_at - now).total_seconds()
+        if seconds_to_start > 60 * 60:
+            return "waiting until one hour before kickoff"
+        if seconds_to_start > cls.FIVE_MINUTES:
+            return "every 10 minutes"
+        if seconds_to_start > cls.ONE_MINUTE:
+            return "every minute"
+        return "every 2 seconds"
+
     @staticmethod
     def is_halftime(match: Match) -> bool:
         status_name = (match.status_name or "").upper()

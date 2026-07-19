@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -10,11 +11,24 @@ from app.clients.espn import InvalidEspnResponseError
 from app.clients.telegram import TelegramClient
 from app.models.match import Match
 from app.models.match_event import MatchEvent, MatchEventKind
+from app.models.monitoring_fetch import MonitoringFetch, MonitoringFetchKind
 from app.monitoring.policy import MonitorPolicy
 from app.services.matches import MatchService
 
 
 logger = logging.getLogger("uvicorn.error")
+
+
+@dataclass(frozen=True)
+class _ScheduledFetch:
+    id: str
+    kind: MonitoringFetchKind
+    tournament: str
+    scheduled_for: datetime
+    frequency: str
+    interval_seconds: float | None = None
+    match_id: str | None = None
+    match_name: str | None = None
 
 
 class MatchMonitorCoordinator:
@@ -27,7 +41,7 @@ class MatchMonitorCoordinator:
         *,
         telegram_client: TelegramClient | None = None,
         timezone: str = "Europe/Madrid",
-        daily_scan_hour: int = 5,
+        daily_scan_hour: int = 10,
         now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         self.match_service = match_service
@@ -38,10 +52,11 @@ class MatchMonitorCoordinator:
         self._now_provider = now_provider
         self._scheduler_task: asyncio.Task[None] | None = None
         self._match_tasks: dict[str, asyncio.Task[None]] = {}
+        self._scheduled_fetches: dict[str, _ScheduledFetch] = {}
         self._notified_match_ids: set[str] = set()
 
     async def start(self) -> None:
-        """Start the startup scan and daily 05:00 scheduler."""
+        """Start the startup scan and daily 10:00 scheduler."""
         if self._scheduler_task is None or self._scheduler_task.done():
             await self.scan_today()
             self._scheduler_task = asyncio.create_task(
@@ -62,6 +77,7 @@ class MatchMonitorCoordinator:
             await asyncio.gather(*tasks, return_exceptions=True)
 
         self._match_tasks.clear()
+        self._scheduled_fetches.clear()
         self._scheduler_task = None
 
     async def scan_today(self) -> None:
@@ -83,6 +99,46 @@ class MatchMonitorCoordinator:
     @property
     def active_monitor_count(self) -> int:
         return sum(not task.done() for task in self._match_tasks.values())
+
+    def get_upcoming_fetches(self, limit: int = 20) -> list[MonitoringFetch]:
+        """Return the next real fetch queued by each active monitor task."""
+        if limit < 1:
+            return []
+
+        now = self._now()
+        queued_fetches = list(self._scheduled_fetches.values())
+
+        if self._scheduler_task is not None and not self._scheduler_task.done():
+            daily_scan_at = self._next_daily_scan_at(now)
+            queued_fetches.extend(
+                _ScheduledFetch(
+                    id=f"daily:{tournament}",
+                    kind=MonitoringFetchKind.DAILY_SCAN,
+                    tournament=tournament,
+                    scheduled_for=daily_scan_at,
+                    frequency=f"daily at {self.daily_scan_hour:02d}:00",
+                )
+                for tournament in self.tournaments
+            )
+
+        queued_fetches.sort(key=lambda fetch: (fetch.scheduled_for, fetch.id))
+        return [
+            MonitoringFetch(
+                id=fetch.id,
+                kind=fetch.kind,
+                tournament=fetch.tournament,
+                match_id=fetch.match_id,
+                match_name=fetch.match_name,
+                scheduled_for=fetch.scheduled_for,
+                seconds_until=round(
+                    max((fetch.scheduled_for - now).total_seconds(), 0.0),
+                    3,
+                ),
+                interval_seconds=fetch.interval_seconds,
+                frequency=fetch.frequency,
+            )
+            for fetch in queued_fetches[:limit]
+        ]
 
     async def _daily_loop(self) -> None:
         try:
@@ -106,8 +162,7 @@ class MatchMonitorCoordinator:
             len(matches),
         )
         for match in matches:
-            self._log_detected_match(match)
-            await self._notify_detected_match(match)
+            await self.announce_detected_match(match)
 
             if match.completed or match.status == "post":
                 continue
@@ -148,13 +203,32 @@ class MatchMonitorCoordinator:
                 halftime_started_at,
             )
             if delay is None:
+                self._scheduled_fetches.pop(self._match_key(current_match), None)
                 logger.info(
                     "MONITORIZACIÓN FINALIZADA | %s",
                     self._match_label(match),
                 )
                 return
 
-            await asyncio.sleep(max(delay, 0.0))
+            delay = max(delay, 0.0)
+            fetch_key = self._match_key(current_match)
+            self._scheduled_fetches[fetch_key] = _ScheduledFetch(
+                id=f"match:{fetch_key}",
+                kind=MonitoringFetchKind.MATCH_POLL,
+                tournament=current_match.tournament,
+                match_id=current_match.id,
+                match_name=self._match_label(current_match),
+                scheduled_for=now + timedelta(seconds=delay),
+                interval_seconds=round(delay, 3),
+                frequency=MonitorPolicy.poll_frequency(
+                    current_match,
+                    now,
+                    halftime_started_at,
+                ),
+            )
+
+            await asyncio.sleep(delay)
+            self._scheduled_fetches.pop(fetch_key, None)
 
             try:
                 matches = await self.match_service.get_matches(
@@ -173,8 +247,8 @@ class MatchMonitorCoordinator:
                 logger.warning("Match %s was not present in ESPN response", match.id)
                 continue
 
-            await self._handle_new_match_events(current_match, refreshed_match)
-            await self._handle_state_transition(current_match, refreshed_match)
+            await self.handle_new_match_events(current_match, refreshed_match)
+            await self.handle_state_transition(current_match, refreshed_match)
 
             if MonitorPolicy.is_halftime(refreshed_match):
                 halftime_started_at = halftime_started_at or self._now()
@@ -185,6 +259,9 @@ class MatchMonitorCoordinator:
 
     def _seconds_until_next_daily_scan(self) -> float:
         now = self._now()
+        return (self._next_daily_scan_at(now) - now).total_seconds()
+
+    def _next_daily_scan_at(self, now: datetime) -> datetime:
         next_scan = now.replace(
             hour=self.daily_scan_hour,
             minute=0,
@@ -193,7 +270,7 @@ class MatchMonitorCoordinator:
         )
         if next_scan <= now:
             next_scan += timedelta(days=1)
-        return (next_scan - now).total_seconds()
+        return next_scan
 
     def _now(self) -> datetime:
         if self._now_provider is not None:
@@ -210,6 +287,7 @@ class MatchMonitorCoordinator:
     ) -> None:
         if self._match_tasks.get(key) is completed_task:
             self._match_tasks.pop(key, None)
+        self._scheduled_fetches.pop(key, None)
 
     @staticmethod
     def _match_key(match: Match) -> str:
@@ -225,6 +303,11 @@ class MatchMonitorCoordinator:
             local_kickoff.strftime("%H:%M"),
             self.timezone.key,
         )
+
+    async def announce_detected_match(self, match: Match) -> None:
+        """Log and notify a newly discovered fixture."""
+        self._log_detected_match(match)
+        await self._notify_detected_match(match)
 
     async def _notify_detected_match(self, match: Match) -> None:
         if self.telegram_client is None:
@@ -304,7 +387,7 @@ class MatchMonitorCoordinator:
                 self._match_label(current),
             )
 
-    async def _handle_state_transition(
+    async def handle_state_transition(
         self,
         previous: Match,
         current: Match,
@@ -334,7 +417,7 @@ class MatchMonitorCoordinator:
             if event.id not in known_event_ids:
                 self._log_match_event(current, event)
 
-    async def _handle_new_match_events(
+    async def handle_new_match_events(
         self,
         previous: Match,
         current: Match,

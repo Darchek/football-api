@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     telegram_api: HttpUrl
     monitored_tournaments: tuple[str, ...] = DEFAULT_MONITORED_TOURNAMENTS
     monitor_timezone: str = "Europe/Madrid"
-    daily_scan_hour: int = 5
+    daily_scan_hour: int = 10
 
     model_config = SettingsConfigDict(
         env_file=".env",

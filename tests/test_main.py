@@ -1,10 +1,12 @@
-from unittest.mock import AsyncMock
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, Mock
 
 from fastapi.testclient import TestClient
 
-from app.api.dependencies import get_match_service
+from app.api.dependencies import get_match_monitor, get_match_service
 from app.main import app
 from app.models.match import Match
+from app.models.monitoring_fetch import MonitoringFetch, MonitoringFetchKind
 from app.models.team import Team
 
 
@@ -73,3 +75,32 @@ def test_la_liga_matches() -> None:
     assert response.json()[0]["tournament"] == "esp.1"
     assert response.json()[0]["away_team"]["name"] == "Away FC"
     match_service.get_today_matches.assert_awaited_once_with("esp.1")
+
+
+def test_monitoring_queue() -> None:
+    monitor = Mock()
+    monitor.get_upcoming_fetches.return_value = [
+        MonitoringFetch(
+            id="match:esp.1:123",
+            kind=MonitoringFetchKind.MATCH_POLL,
+            tournament="esp.1",
+            match_id="123",
+            match_name="Home FC vs Away FC",
+            scheduled_for=datetime(2026, 7, 19, 12, 10, tzinfo=timezone.utc),
+            seconds_until=600,
+            interval_seconds=600,
+            frequency="every 10 minutes",
+        )
+    ]
+    app.dependency_overrides[get_match_monitor] = lambda: monitor
+
+    try:
+        response = client.get("/api/v1/monitoring/queue?limit=20")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()[0]["kind"] == "match_poll"
+    assert response.json()[0]["tournament"] == "esp.1"
+    assert response.json()[0]["seconds_until"] == 600
+    monitor.get_upcoming_fetches.assert_called_once_with(20)
