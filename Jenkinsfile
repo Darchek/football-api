@@ -1,4 +1,5 @@
 pipeline {
+    // No-op comment to trigger a fresh GitHub push/build.
     agent any
 
     triggers {
