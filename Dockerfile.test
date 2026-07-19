@@ -1,0 +1,17 @@
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY app ./app
+COPY tests ./tests
+COPY main.py ./
+
+RUN python -m pip install --upgrade pip \
+    && python -m pip install '.[dev]'
+
+CMD ["pytest", "tests", "-v", "--tb=short"]
